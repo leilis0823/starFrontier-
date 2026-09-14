@@ -1,0 +1,197 @@
+name: Build STAR FRONTIER Android APKs
+
+on:
+  workflow_dispatch:
+
+  push:
+    paths:
+      - '**/*.zip'
+      - '.github/workflows/android-build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-apks:
+    name: Build Nubia Fold and Universal APKs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Prepare Android SDK 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --version
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Find STAR FRONTIER source ZIP
+        id: zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_PATH="$(
+            find . -maxdepth 1 -type f -name 'STAR_FRONTIER*.zip' -print \
+            | sort -V \
+            | tail -n 1
+          )"
+
+          if [ -z "$ZIP_PATH" ]; then
+            echo "ERROR: STAR FRONTIER source ZIP was not found."
+            find . -maxdepth 2 -type f | sort
+            exit 1
+          fi
+
+          echo "Selected ZIP: $ZIP_PATH"
+          echo "zip_path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Extract STAR FRONTIER source
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf extracted
+          mkdir -p extracted
+          unzip -q "${{ steps.zip.outputs.zip_path }}" -d extracted
+          find extracted -maxdepth 4 -type d | sort | head -n 300
+
+      - name: Locate Android project
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          GRADLEW_PATH="$(find extracted -type f -name gradlew -print | head -n 1)"
+
+          if [ -z "$GRADLEW_PATH" ]; then
+            echo "ERROR: Gradle wrapper (gradlew) was not found."
+            find extracted -type f | sort | head -n 1000
+            exit 1
+          fi
+
+          ANDROID_DIR="$(dirname "$GRADLEW_PATH")"
+          echo "Gradle wrapper: $GRADLEW_PATH"
+          echo "Android project: $ANDROID_DIR"
+          echo "android_dir=$ANDROID_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Detect STAR FRONTIER version
+        id: meta
+        working-directory: ${{ steps.locate.outputs.android_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION_NAME="$(
+            grep -m1 -E 'versionName[[:space:]]+' app/build.gradle \
+            | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+            | head -n 1
+          )"
+
+          if [ -z "$VERSION_NAME" ]; then
+            echo "ERROR: versionName could not be detected from app/build.gradle."
+            exit 1
+          fi
+
+          echo "Detected version: $VERSION_NAME"
+          echo "version=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Gradle Wrapper
+        working-directory: ${{ steps.locate.outputs.android_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f gradlew
+          test -f gradle/wrapper/gradle-wrapper.jar
+          test -f gradle/wrapper/gradle-wrapper.properties
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Build Nubia Fold and Universal debug APKs
+        working-directory: ${{ steps.locate.outputs.android_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew \
+            --no-daemon \
+            --stacktrace \
+            assembleNubiaDebug \
+            assembleUniversalDebug
+
+      - name: Locate generated APKs
+        id: apks
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ANDROID_DIR="${{ steps.locate.outputs.android_dir }}"
+
+          find "$ANDROID_DIR/app/build/outputs/apk" -type f -name '*.apk' -print | sort || true
+
+          NUBIA_APK="$(
+            find "$ANDROID_DIR/app/build/outputs/apk/nubia/debug" \
+              -maxdepth 1 -type f -name '*.apk' -print \
+            | head -n 1
+          )"
+
+          UNIVERSAL_APK="$(
+            find "$ANDROID_DIR/app/build/outputs/apk/universal/debug" \
+              -maxdepth 1 -type f -name '*.apk' -print \
+            | head -n 1
+          )"
+
+          if [ -z "$NUBIA_APK" ] || [ ! -f "$NUBIA_APK" ]; then
+            echo "ERROR: Nubia Fold debug APK was not found."
+            exit 1
+          fi
+
+          if [ -z "$UNIVERSAL_APK" ] || [ ! -f "$UNIVERSAL_APK" ]; then
+            echo "ERROR: Universal debug APK was not found."
+            exit 1
+          fi
+
+          echo "nubia_apk=$NUBIA_APK" >> "$GITHUB_OUTPUT"
+          echo "universal_apk=$UNIVERSAL_APK" >> "$GITHUB_OUTPUT"
+
+      - name: Collect APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.meta.outputs.version }}"
+
+          rm -rf dist
+          mkdir -p dist
+
+          cp "${{ steps.apks.outputs.nubia_apk }}" \
+            "dist/STAR_FRONTIER_v${VERSION}_Nubia_Fold_debug.apk"
+
+          cp "${{ steps.apks.outputs.universal_apk }}" \
+            "dist/STAR_FRONTIER_v${VERSION}_Universal_debug.apk"
+
+          sha256sum dist/*.apk > dist/SHA256SUMS.txt
+
+          ls -lh dist
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: STAR_FRONTIER_v${{ steps.meta.outputs.version }}_APKs
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
