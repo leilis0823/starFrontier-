@@ -5,7 +5,7 @@ on:
 
   push:
     paths:
-      - '**/*.zip'
+      - 'STAR_FRONTIER*.zip'
       - '.github/workflows/android-build.yml'
 
 permissions:
@@ -15,6 +15,7 @@ jobs:
   build-apks:
     name: Build Nubia Fold and Universal APKs
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -26,18 +27,38 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
+      - name: Set up Android SDK 35
         uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: '14742923'
+          packages: >-
+            platform-tools
+            platforms;android-35
+            build-tools;35.0.0
 
-      - name: Prepare Android SDK 35
+      - name: Verify Android SDK 35
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+
+          command -v sdkmanager
           sdkmanager --version
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
+          sdkmanager --list_installed
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+
+          if [ -z "$SDK_ROOT" ]; then
+            echo "ERROR: Neither ANDROID_SDK_ROOT nor ANDROID_HOME is set."
+            exit 1
+          fi
+
+          test -d "$SDK_ROOT/platforms/android-35"
+          test -d "$SDK_ROOT/build-tools/35.0.0"
+
+          echo "Android SDK 35 is ready at: $SDK_ROOT"
 
       - name: Find STAR FRONTIER source ZIP
         id: zip
@@ -45,17 +66,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          ZIP_PATH="$(
+          mapfile -t ZIP_CANDIDATES < <(
             find . -maxdepth 1 -type f -name 'STAR_FRONTIER*.zip' -print \
-            | sort -V \
-            | tail -n 1
-          )"
+            | sort -V
+          )
 
-          if [ -z "$ZIP_PATH" ]; then
-            echo "ERROR: STAR FRONTIER source ZIP was not found."
+          if [ "${#ZIP_CANDIDATES[@]}" -eq 0 ]; then
+            echo "ERROR: STAR FRONTIER source ZIP was not found in the repository root."
             find . -maxdepth 2 -type f | sort
             exit 1
           fi
+
+          ZIP_PATH="${ZIP_CANDIDATES[-1]}"
 
           echo "Selected ZIP: $ZIP_PATH"
           echo "zip_path=$ZIP_PATH" >> "$GITHUB_OUTPUT"
@@ -64,9 +86,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           rm -rf extracted
           mkdir -p extracted
+
           unzip -q "${{ steps.zip.outputs.zip_path }}" -d extracted
+
+          echo "Top-level extracted structure:"
           find extracted -maxdepth 4 -type d | sort | head -n 300
 
       - name: Locate Android project
@@ -75,7 +101,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          GRADLEW_PATH="$(find extracted -type f -name gradlew -print | head -n 1)"
+          GRADLEW_PATH="$(
+            find extracted -type f -name gradlew -print \
+            | sort \
+            | head -n 1
+          )"
 
           if [ -z "$GRADLEW_PATH" ]; then
             echo "ERROR: Gradle wrapper (gradlew) was not found."
@@ -84,9 +114,41 @@ jobs:
           fi
 
           ANDROID_DIR="$(dirname "$GRADLEW_PATH")"
+
+          if [ ! -f "$ANDROID_DIR/settings.gradle" ] && \
+             [ ! -f "$ANDROID_DIR/settings.gradle.kts" ]; then
+            echo "ERROR: Gradle wrapper was found, but no settings.gradle/settings.gradle.kts exists beside it."
+            echo "Candidate Android directory: $ANDROID_DIR"
+            exit 1
+          fi
+
           echo "Gradle wrapper: $GRADLEW_PATH"
           echo "Android project: $ANDROID_DIR"
           echo "android_dir=$ANDROID_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Configure Android SDK path
+        working-directory: ${{ steps.locate.outputs.android_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+
+          if [ -z "$SDK_ROOT" ]; then
+            echo "ERROR: Android SDK environment variables are missing."
+            exit 1
+          fi
+
+          printf 'sdk.dir=%s\n' "$SDK_ROOT" > local.properties
+
+          echo "--- local.properties ---"
+          cat local.properties
+
+          echo "--- Required SDK directories ---"
+          ls -ld \
+            "$SDK_ROOT/platforms/android-35" \
+            "$SDK_ROOT/build-tools/35.0.0" \
+            "$SDK_ROOT/platform-tools"
 
       - name: Detect STAR FRONTIER version
         id: meta
@@ -95,40 +157,69 @@ jobs:
         run: |
           set -euo pipefail
 
+          BUILD_FILE=""
+
+          if [ -f app/build.gradle ]; then
+            BUILD_FILE="app/build.gradle"
+          elif [ -f app/build.gradle.kts ]; then
+            BUILD_FILE="app/build.gradle.kts"
+          else
+            echo "ERROR: app/build.gradle or app/build.gradle.kts was not found."
+            exit 1
+          fi
+
           VERSION_NAME="$(
-            grep -m1 -E 'versionName[[:space:]]+' app/build.gradle \
+            grep -m1 -E 'versionName[[:space:]=]+' "$BUILD_FILE" \
             | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
             | head -n 1
           )"
 
           if [ -z "$VERSION_NAME" ]; then
-            echo "ERROR: versionName could not be detected from app/build.gradle."
+            echo "ERROR: versionName could not be detected from $BUILD_FILE."
+            grep -n 'versionName' "$BUILD_FILE" || true
             exit 1
           fi
 
           echo "Detected version: $VERSION_NAME"
           echo "version=$VERSION_NAME" >> "$GITHUB_OUTPUT"
 
-      - name: Verify Gradle Wrapper
+      - name: Verify Gradle Wrapper and build environment
         working-directory: ${{ steps.locate.outputs.android_dir }}
         shell: bash
         run: |
           set -euo pipefail
+
           test -f gradlew
           test -f gradle/wrapper/gradle-wrapper.jar
           test -f gradle/wrapper/gradle-wrapper.properties
+
           chmod +x gradlew
+
+          echo "--- Java ---"
+          java -version
+
+          echo "--- Gradle Wrapper ---"
+          cat gradle/wrapper/gradle-wrapper.properties
+
+          echo "--- Gradle ---"
           ./gradlew --version
+
+          echo "--- Android tasks ---"
+          ./gradlew --no-daemon tasks --all \
+            | grep -E 'assemble(Nubia|Universal)Debug' || true
 
       - name: Build Nubia Fold and Universal debug APKs
         working-directory: ${{ steps.locate.outputs.android_dir }}
         shell: bash
         run: |
           set -euo pipefail
+
           chmod +x gradlew
+
           ./gradlew \
             --no-daemon \
             --stacktrace \
+            --warning-mode all \
             assembleNubiaDebug \
             assembleUniversalDebug
 
@@ -139,18 +230,24 @@ jobs:
           set -euo pipefail
 
           ANDROID_DIR="${{ steps.locate.outputs.android_dir }}"
+          APK_ROOT="$ANDROID_DIR/app/build/outputs/apk"
 
-          find "$ANDROID_DIR/app/build/outputs/apk" -type f -name '*.apk' -print | sort || true
+          echo "--- Generated APKs ---"
+          find "$APK_ROOT" -type f -name '*.apk' -print | sort || true
 
           NUBIA_APK="$(
-            find "$ANDROID_DIR/app/build/outputs/apk/nubia/debug" \
-              -maxdepth 1 -type f -name '*.apk' -print \
+            find "$APK_ROOT" -type f \
+              -path '*/nubia/debug/*.apk' \
+              -name '*.apk' -print \
+            | sort \
             | head -n 1
           )"
 
           UNIVERSAL_APK="$(
-            find "$ANDROID_DIR/app/build/outputs/apk/universal/debug" \
-              -maxdepth 1 -type f -name '*.apk' -print \
+            find "$APK_ROOT" -type f \
+              -path '*/universal/debug/*.apk' \
+              -name '*.apk' -print \
+            | sort \
             | head -n 1
           )"
 
@@ -185,7 +282,9 @@ jobs:
 
           sha256sum dist/*.apk > dist/SHA256SUMS.txt
 
+          echo "--- Distribution files ---"
           ls -lh dist
+          echo "--- SHA-256 ---"
           cat dist/SHA256SUMS.txt
 
       - name: Upload APK artifacts
@@ -195,3 +294,23 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 30
+
+      - name: Show diagnostic information on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "=== STAR FRONTIER Android build diagnostics ==="
+          echo "Runner OS: $RUNNER_OS"
+          echo "Java:"
+          java -version || true
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+          echo "sdkmanager:"
+          command -v sdkmanager || true
+          sdkmanager --version || true
+          echo "Repository ZIPs:"
+          find . -maxdepth 1 -type f -name 'STAR_FRONTIER*.zip' -print | sort -V || true
+          echo "Gradle wrappers found:"
+          find extracted -type f -name gradlew -print 2>/dev/null || true
+          echo "APK files found:"
+          find extracted -type f -name '*.apk' -print 2>/dev/null || true
